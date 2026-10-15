@@ -8,3 +8,5 @@ tests/output/
 *.partial.mp4
 *.mp4
 !tests/assets/*.mp4
+scripts/_diag/
+xx/
