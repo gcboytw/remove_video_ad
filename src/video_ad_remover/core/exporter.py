@@ -320,7 +320,8 @@ def build_command(
         cmd += ["-preset", settings.preset or "veryfast"]
 
     if settings.pix_fmt:
-        cmd += ["-pix_fmt", settings.pix_fmt]
+        pix_fmt = "nv12" if codec == "h264_qsv" and settings.pix_fmt == "yuv420p" else settings.pix_fmt
+        cmd += ["-pix_fmt", pix_fmt]
 
     if graph.audio_label:
         cmd += ["-c:a", settings.audio_codec, "-b:a", settings.audio_bitrate]

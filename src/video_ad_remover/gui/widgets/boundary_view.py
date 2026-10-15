@@ -170,7 +170,7 @@ class BoundaryView(QWidget):
             (self.card_last, f_last),
             (self.card_resume, f_resume),
         ]:
-            img = self.extractor.get_frame(f_idx, target_size=(180, 100))
+            img = self.extractor.get_exact_frame(f_idx, target_size=(180, 100))
             pm = _mat_to_pixmap(img) if img is not None else None
             t = self.meta.time_of(f_idx) if f_idx < total else 0.0
             card.set_content(f_idx, t, pm)
