@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import os
+import platform
 import subprocess
 import threading
 import time
@@ -30,6 +31,73 @@ from video_ad_remover.models.interval import FrameInterval, KeepSegment
 from video_ad_remover.models.video_meta import VideoMetadata
 
 TrimMode = Literal["frame", "time"]
+
+_DETECTED_ENCODER: str | None = None
+
+
+def detect_optimal_video_codec(ffmpeg: str | None = None, *, reset_cache: bool = False) -> str:
+    """依系統環境與硬體自動偵測最佳的 H.264 編碼器：
+
+    1. macOS (Apple Silicon / Intel Mac) -> h264_videotoolbox
+    2. Windows / Linux (Intel Lunar Lake / QSV) -> h264_qsv
+    3. 其他 / 安全降級 -> libx264 (CPU)
+    """
+    global _DETECTED_ENCODER
+    if _DETECTED_ENCODER is not None and not reset_cache:
+        return _DETECTED_ENCODER
+
+    ffmpeg_bin = ffmpeg or resolve_tool("ffmpeg")
+    encoders_out = ""
+    try:
+        proc = subprocess.run(
+            [ffmpeg_bin, "-encoders"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True,
+            **hidden_window_kwargs(),
+        )
+        encoders_out = proc.stdout
+    except Exception:
+        pass
+
+    sys_name = platform.system()
+    if sys_name == "Darwin" and "h264_videotoolbox" in encoders_out:
+        _DETECTED_ENCODER = "h264_videotoolbox"
+    elif sys_name in ["Windows", "Linux"] and "h264_qsv" in encoders_out:
+        try:
+            test_proc = subprocess.run(
+                [
+                    ffmpeg_bin,
+                    "-y",
+                    "-v",
+                    "quiet",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "color=c=black:s=64x64:d=0.04",
+                    "-c:v",
+                    "h264_qsv",
+                    "-global_quality",
+                    "24",
+                    "-f",
+                    "null",
+                    "-",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                **hidden_window_kwargs(),
+            )
+            if test_proc.returncode == 0:
+                _DETECTED_ENCODER = "h264_qsv"
+            else:
+                _DETECTED_ENCODER = "libx264"
+        except Exception:
+            _DETECTED_ENCODER = "libx264"
+    else:
+        _DETECTED_ENCODER = "libx264"
+
+    return _DETECTED_ENCODER
 
 
 class ExportError(RuntimeError):
@@ -50,13 +118,13 @@ class ExportCancelled(ExportError):
 
 @dataclass(frozen=True)
 class ExportSettings:
-    video_codec: str = "libx264"
-    crf: int = 18
+    video_codec: str = "auto"
+    crf: int = 24
     video_bitrate: str | None = None  # 設定後改用位元率模式（如 "8M"），忽略 crf
-    preset: str | None = "medium"
+    preset: str | None = None
     pix_fmt: str | None = "yuv420p"  # None = 保留濾鏡輸出格式
     audio_codec: str = "aac"
-    audio_bitrate: str = "192k"
+    audio_bitrate: str = "128k"
     faststart: bool = True
     overwrite: bool = False
     extra_args: tuple[str, ...] = ()
@@ -197,6 +265,13 @@ def build_filtergraph(
     return FilterGraph(text=";".join(parts), video_label="[vout]", audio_label=audio_label, mode=mode)
 
 
+def resolve_video_codec(settings: ExportSettings, *, ffmpeg: str) -> str:
+    """決定具體使用的視訊編碼器（若為 auto 則自動偵測最佳硬體加速）。"""
+    if settings.video_codec and settings.video_codec != "auto":
+        return settings.video_codec
+    return detect_optimal_video_codec(ffmpeg)
+
+
 def build_command(
     meta: VideoMetadata,
     graph: FilterGraph,
@@ -205,6 +280,8 @@ def build_command(
     *,
     ffmpeg: str,
 ) -> list[str]:
+    codec = resolve_video_codec(settings, ffmpeg=ffmpeg)
+
     cmd = [
         ffmpeg, "-hide_banner", "-nostdin", "-y", "-v", "warning",
         "-i", str(meta.path),
@@ -214,13 +291,34 @@ def build_command(
     if graph.audio_label:
         cmd += ["-map", graph.audio_label]
 
-    cmd += ["-c:v", settings.video_codec]
+    cmd += ["-c:v", codec]
     if settings.video_bitrate:
         cmd += ["-b:v", settings.video_bitrate]
     else:
-        cmd += ["-crf", str(settings.crf)]
-    if settings.preset:
-        cmd += ["-preset", settings.preset]
+        if codec == "h264_qsv":
+            cmd += ["-global_quality", str(settings.crf)]
+        elif codec == "h264_videotoolbox":
+            # CRF 24 對應品質 60；CRF 越小（品質要求越高）對應 q:v 越高
+            q_v = max(30, min(85, int(60 - (settings.crf - 24) * 2.5)))
+            cmd += ["-q:v", str(q_v)]
+        else:
+            cmd += ["-crf", str(settings.crf)]
+
+    # Preset 設定適配
+    if codec == "h264_qsv":
+        qsv_presets = {"veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"}
+        preset = settings.preset
+        if preset == "ultrafast":
+            preset = "veryfast"
+        elif preset not in qsv_presets:
+            preset = "fast"
+        cmd += ["-preset", preset]
+    elif codec == "h264_videotoolbox":
+        # VideoToolbox 不支援標準 x264 preset，不傳入 -preset
+        pass
+    else:
+        cmd += ["-preset", settings.preset or "veryfast"]
+
     if settings.pix_fmt:
         cmd += ["-pix_fmt", settings.pix_fmt]
 

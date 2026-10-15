@@ -108,8 +108,9 @@ class TimelineExportPanel(QWidget):
 
         self.spin_crf = QSpinBox()
         self.spin_crf.setRange(10, 35)
-        self.spin_crf.setValue(18)
-        self.spin_crf.setPrefix("CRF: ")
+        self.spin_crf.setValue(24)
+        self.spin_crf.setPrefix("品質 (CRF): ")
+        self.spin_crf.setToolTip("推薦值 23~25（兼顧畫質與容量）。數值越小畫質越高但檔案越大；18 會使檔案暴增。")
 
         self.btn_select_out = QPushButton("選擇輸出檔名...")
         self.btn_select_out.clicked.connect(self._select_output_file)

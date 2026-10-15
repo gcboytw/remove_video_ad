@@ -233,6 +233,9 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "計畫建立失敗", f"無法建立剪輯計畫：\n{exc}")
             return
 
+        codec = plan.command[plan.command.index("-c:v") + 1] if "-c:v" in plan.command else "unknown"
+        self.statusBar().showMessage(f"🚀 開始輸出 MP4（硬體加速編碼器: {codec}，CRF: {crf}）", 6000)
+
         self.timeline_panel.set_exporting_state(True)
         self.export_worker = ExportWorker(plan)
         self.export_worker.progress_updated.connect(self._on_export_progress)
