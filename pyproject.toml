@@ -1,0 +1,36 @@
+[project]
+name = "video-ad-remover"
+version = "0.1.0"
+description = "Semi-automatic frame-accurate video ad detector and remover using Python, OpenCV, and FFmpeg."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.0.0",
+    "opencv-python>=4.10.0",
+    "pyside6>=6.7.0",
+    "scenedetect>=0.6.4",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.0",
+    "ruff>=0.6.0",
+]
+
+[project.scripts]
+ad-remover = "video_ad_remover.main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/video_ad_remover"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"

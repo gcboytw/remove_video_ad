@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.DS_Store
+tests/output/
+*.partial.mp4
+*.mp4
+!tests/assets/*.mp4
