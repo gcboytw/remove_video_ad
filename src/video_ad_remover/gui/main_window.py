@@ -41,7 +41,7 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Video Ad Detector & Remover (v2.1)")
-        self.resize(1180, 780)
+        self.resize(1600, 940)
 
         self.meta: VideoMetadata | None = None
         self.extractor: FrameExtractor | None = None
@@ -100,9 +100,9 @@ class MainWindow(QMainWindow):
         self.candidate_list.candidate_selected.connect(self._on_candidate_selected)
         self.candidate_list.candidates_updated.connect(self._on_candidates_updated)
         h_splitter.addWidget(self.candidate_list)
-
-        h_splitter.setStretchFactor(0, 3)
-        h_splitter.setStretchFactor(1, 2)
+        h_splitter.setSizes([1120, 480])
+        h_splitter.setStretchFactor(0, 7)
+        h_splitter.setStretchFactor(1, 3)
         main_layout.addWidget(h_splitter, stretch=1)
 
         # 3. 底部：視覺化時間軸與輸出面板

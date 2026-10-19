@@ -10,3 +10,4 @@ tests/output/
 !tests/assets/*.mp4
 scripts/_diag/
 xx/
+old/
