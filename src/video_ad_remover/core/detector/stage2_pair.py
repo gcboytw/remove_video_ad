@@ -37,6 +37,7 @@ class PairConfig:
     duration_sigma: float = 3.5  # 緊密聚焦在 25 秒附近
     iou_threshold: float = 0.40  # 降低重複候選門檻
     max_internal_variance: float = 0.45  # 內部取樣平均差異上限，超過視為正片運鏡淘汰
+    stability_sigma: float = 0.12  # 圖卡內部穩定度衰減常數（凸顯靜態圖卡優勢，壓制正片運鏡）
 
 
 def _duration_score(duration: float, target: float, sigma: float) -> float:
@@ -58,7 +59,6 @@ def pair_and_score(
 
     candidates: list[AdCandidate] = []
     extractor = FrameExtractor(path, meta)
-    fps = meta.nominal_fps if meta.nominal_fps > 0 else 30.0
 
     with extractor:
         n = len(cut_points)
@@ -79,9 +79,11 @@ def pair_and_score(
                 # 2. 切點強度分數
                 score_cut = 0.5 * (cp_in.diff_score + cp_out.diff_score)
 
-                # 3. 採樣正片前後（各 1 秒處）
-                f_before = max(0, int(cp_in.frame_index - fps))
-                f_after = min(meta.frame_count - 1, int(cp_out.frame_index + fps))
+                # 3. 採樣正片前後（各 1 秒處），改為時間軸標準映射（VFR/CFR 安全）
+                t_in = cp_in.timestamp
+                t_out = cp_out.timestamp
+                f_before = meta.frame_at_time(max(0.0, t_in - 1.0))
+                f_after = meta.frame_at_time(min(meta.end_time, t_out + 1.0))
 
                 img_before = extractor.get_frame(f_before, target_size=(160, 90))
                 img_after = extractor.get_frame(f_after, target_size=(160, 90))
@@ -96,12 +98,13 @@ def pair_and_score(
                     diff_context = compare_frames(feat_b, feat_a)
                     score_context = 1.0 - diff_context
 
-                # 4. 廣告區間內部「版面色彩穩定度」取樣檢驗（取 5 個時間點）
+                # 4. 廣告區間內部「版面色彩穩定度」取樣檢驗（依時間軸均勻採樣 4 個時間點）
                 s_frame = cp_in.frame_index
                 e_frame = cp_out.frame_index
-                internal_samples = [
-                    int(s_frame + (e_frame - s_frame) * r) for r in (0.2, 0.4, 0.6, 0.8)
+                sample_times = [
+                    t_in + (t_out - t_in) * r for r in (0.2, 0.4, 0.6, 0.8)
                 ]
+                internal_samples = [meta.frame_at_time(t) for t in sample_times]
 
                 internal_feats = []
                 for f_idx in internal_samples:
@@ -124,8 +127,9 @@ def pair_and_score(
                 if avg_internal_diff > cfg.max_internal_variance:
                     continue
 
-                # 內部版面穩定度分數：變化越少，分數越高
-                score_stability = max(0.0, 1.0 - (avg_internal_diff / cfg.max_internal_variance))
+                # 內部版面穩定度分數：以高斯衰減重賞高度靜止之圖卡特徵
+                # 靜態圖卡 (avg_diff ~ 0.0) 拿滿分 1.0；正片微幅運鏡 (avg_diff >= 0.12) 分數迅速衰減
+                score_stability = math.exp(-0.5 * (avg_internal_diff / cfg.stability_sigma) ** 2)
 
                 # 5. 內部與正片的反差度（廣告圖卡與前後正片完全不同風格）
                 score_contrast = 0.5
@@ -135,12 +139,12 @@ def pair_and_score(
                     contrast_a = compare_frames(mid_feat, feat_a)
                     score_contrast = 0.5 * (contrast_b + contrast_a)
 
-                # 綜合加權：時長(30%) + 內部穩定度(25%) + 切點強度(20%) + 前後正片呼應(15%) + 反差(10%)
+                # 綜合加權：內部穩定度(35%) + 時長(25%) + 切點強度(20%) + 前後正片呼應(10%) + 反差(10%)
                 total_score = (
-                    0.30 * score_dur
-                    + 0.25 * score_stability
+                    0.35 * score_stability
+                    + 0.25 * score_dur
                     + 0.20 * score_cut
-                    + 0.15 * score_context
+                    + 0.10 * score_context
                     + 0.10 * score_contrast
                 )
 
