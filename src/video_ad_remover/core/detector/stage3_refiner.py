@@ -55,6 +55,65 @@ def _find_exact_cut_sequential(
     return best_cut_frame
 
 
+def _snap_to_card_boundary(
+    extractor: FrameExtractor,
+    start_frame: int,
+    end_frame: int,
+    fps: float,
+    max_search_sec: float = 3.0,
+    threshold: float = 0.25,
+) -> tuple[int, int]:
+    """若區間內部為靜態圖卡，使用二分搜尋將邊界向內精準吸附至圖卡本體 (如 7570 ~ 8213)。"""
+    if start_frame >= end_frame:
+        return start_frame, end_frame
+
+    mid_frame = (start_frame + end_frame) // 2
+    img_mid = extractor.get_exact_frame(mid_frame, target_size=(320, 180))
+    if img_mid is None:
+        return start_frame, end_frame
+
+    feat_template = compute_frame_features(img_mid)
+    search_limit = int(max_search_sec * fps)
+
+    # 1. 二分搜尋圖卡起點 (第一個 diff <= threshold 的影格)
+    low, high = start_frame, min(end_frame - 1, start_frame + search_limit)
+    snapped_start = start_frame
+    l, r = low, high
+    while l <= r:
+        mid = (l + r) // 2
+        img = extractor.get_exact_frame(mid, target_size=(320, 180))
+        if img is None:
+            break
+        diff = compare_frames(compute_frame_features(img), feat_template)
+        if diff <= threshold:
+            snapped_start = mid
+            r = mid - 1
+        else:
+            l = mid + 1
+
+    # 2. 二分搜尋圖卡終點 (最後一個 diff <= threshold 的影格)
+    low, high = max(start_frame + 1, end_frame - search_limit), end_frame
+    snapped_end = end_frame
+    l, r = low, high
+    while l <= r:
+        mid = (l + r) // 2
+        img = extractor.get_exact_frame(mid, target_size=(320, 180))
+        if img is None:
+            break
+        diff = compare_frames(compute_frame_features(img), feat_template)
+        if diff <= threshold:
+            snapped_end = mid
+            l = mid + 1
+        else:
+            r = mid - 1
+
+    # 安全校驗：吸附後時長若在合理廣告範圍 (>= 15s)，則採納吸附結果
+    if (snapped_end - snapped_start) / fps >= 15.0:
+        return snapped_start, snapped_end
+
+    return start_frame, end_frame
+
+
 def refine_candidate_boundaries(
     candidates: list[AdCandidate],
     path: str | Path,
@@ -65,7 +124,7 @@ def refine_candidate_boundaries(
     progress_cb: Callable[[float], None] | None = None,
     cancel_event: threading.Event | None = None,
 ) -> list[AdCandidate]:
-    """針對候選區間進行 Stage 3 邊界逐格精確化。"""
+    """針對候選區間進行 Stage 3 邊界逐格精確化與圖卡吸附。"""
     if not candidates:
         return []
 
@@ -99,6 +158,11 @@ def refine_candidate_boundaries(
             if exact_start >= exact_end:
                 exact_start = cand.start_frame
                 exact_end = cand.end_frame
+
+            # 進一步向內精準吸附至靜態圖卡本體（排除淡入淡出動畫干擾）
+            exact_start, exact_end = _snap_to_card_boundary(
+                extractor, exact_start, exact_end, fps
+            )
 
             refined_cand = AdCandidate(
                 interval=FrameInterval(exact_start, exact_end),
