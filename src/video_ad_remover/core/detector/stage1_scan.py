@@ -94,7 +94,12 @@ def scan_cut_points(
     with extractor:
         prev_feat: tuple[np.ndarray, np.ndarray] | None = None
 
-        for frame_idx, frame in extractor.read_sampled_frames(step=step, target_long_edge=target_long_edge):
+        for frame_idx, frame in extractor.read_sampled_frames(
+            step=step,
+            target_long_edge=target_long_edge,
+            sample_fps=sample_fps,
+            cancel_event=cancel_event,
+        ):
             if cancel_event.is_set():
                 break
 

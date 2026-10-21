@@ -23,7 +23,7 @@ from video_ad_remover.models.video_meta import VideoMetadata
 @dataclass(frozen=True)
 class PipelineConfig:
     sample_fps: float = 3.0  # Stage 1 取樣頻率
-    diff_threshold: float = 0.42  # 提高切點門檻，過濾正片正常鏡頭轉場
+    diff_threshold: float = 0.35  # 平衡切點門檻，確保特殊壓製與低碼率影片切點不被誤殺
     pair_config: PairConfig = PairConfig()  # Stage 2 參數（時長窗、內部穩定度等）
     refine_window_sec: float = 1.0  # Stage 3 搜尋窗秒數
 
