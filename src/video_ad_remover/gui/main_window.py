@@ -248,8 +248,15 @@ class MainWindow(QMainWindow):
 
     def _on_export_success(self, result: ExportResult) -> None:
         self.timeline_panel.set_exporting_state(False)
+        used_codec = (
+            result.plan.command[result.plan.command.index("-c:v") + 1]
+            if "-c:v" in result.plan.command
+            else "h264"
+        )
         QMessageBox.information(
-            self, "輸出完成", f"影片剪輯完成並已通過品質驗證！\n儲存至：{result.output}\n耗時：{result.elapsed:.1f} 秒"
+            self,
+            "輸出完成",
+            f"影片剪輯完成並已通過品質驗證！\n編碼器：{used_codec}\n儲存至：{result.output}\n耗時：{result.elapsed:.1f} 秒",
         )
 
     def _on_export_error(self, err_msg: str) -> None:
