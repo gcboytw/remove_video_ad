@@ -21,7 +21,8 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+import logging
 from pathlib import Path
 from typing import IO, Literal
 
@@ -31,6 +32,8 @@ from video_ad_remover.models.interval import FrameInterval, KeepSegment
 from video_ad_remover.models.video_meta import VideoMetadata
 
 TrimMode = Literal["frame", "time"]
+
+logger = logging.getLogger(__name__)
 
 _DETECTED_ENCODER: str | None = None
 
@@ -149,6 +152,7 @@ class ExportPlan:
     expected_duration: float
     expected_frames: int
     settings: ExportSettings
+    meta: VideoMetadata | None = None
 
 
 @dataclass(frozen=True)
@@ -328,7 +332,13 @@ def build_command(
         if meta.audio and meta.audio.sample_rate:
             cmd += ["-ar", str(meta.audio.sample_rate)]
 
-    cmd += ["-fps_mode", "passthrough", "-map_chapters", "-1"]
+    fps_mode = "vfr" if meta.is_vfr else "auto"
+    cmd += [
+        "-fps_mode", fps_mode,
+        "-avoid_negative_ts", "make_zero",
+        "-max_muxing_queue_size", "2048",
+        "-map_chapters", "-1",
+    ]
     if settings.faststart:
         cmd += ["-movflags", "+faststart"]
     cmd += list(settings.extra_args)
@@ -374,6 +384,7 @@ def plan_export(
         expected_duration=sum(meta.segment_duration(s.start_frame, s.end_frame) for s in segments),
         expected_frames=sum(s.length for s in segments),
         settings=settings,
+        meta=meta,
     )
 
 
@@ -462,6 +473,7 @@ def run_export(
     progress_cb: ProgressCallback | None = None,
     cancel_event: threading.Event | None = None,
     log_lines: int = 200,
+    allow_fallback: bool = True,
 ) -> ExportResult:
     """執行 FFmpeg 輸出。可由另一執行緒設定 ``cancel_event`` 安全取消（FR-012）。"""
     if plan.output.exists() and not plan.settings.overwrite:
@@ -504,6 +516,32 @@ def run_export(
         raise ExportCancelled("使用者已取消輸出，暫存檔已清除", tail)
     if returncode != 0:
         _safe_unlink(plan.partial_path)
+        is_hw = (
+            "-c:v" in plan.command
+            and plan.command[plan.command.index("-c:v") + 1]
+            in ("h264_qsv", "h264_nvenc", "h264_amf", "h264_videotoolbox")
+        )
+        if allow_fallback and is_hw and plan.meta is not None:
+            logger.warning(
+                "硬體加速編碼失敗（exit code %s），自動降級切換至 libx264 (CPU) 重新嘗試輸出...",
+                returncode,
+            )
+            fallback_settings = replace(plan.settings, video_codec="libx264")
+            fallback_cmd = build_command(
+                plan.meta,
+                plan.graph,
+                plan.partial_path,
+                fallback_settings,
+                ffmpeg=plan.command[0],
+            )
+            fallback_plan = replace(plan, command=tuple(fallback_cmd), settings=fallback_settings)
+            return run_export(
+                fallback_plan,
+                progress_cb=progress_cb,
+                cancel_event=cancel_event,
+                log_lines=log_lines,
+                allow_fallback=False,
+            )
         raise ExportError(f"FFmpeg 執行失敗（exit code {returncode}）", tail)
     if not plan.partial_path.is_file() or plan.partial_path.stat().st_size == 0:
         raise ExportError("FFmpeg 結束但沒有產生輸出檔", tail)
