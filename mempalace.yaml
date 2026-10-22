@@ -1,0 +1,25 @@
+wing: remove_video_ad
+rooms:
+- name: testing
+  description: Files from tests/
+  keywords:
+  - testing
+  - tests
+- name: documentation
+  description: Files from docs/
+  keywords:
+  - documentation
+  - docs
+- name: ai_chat
+  description: Files from ai-chat/
+  keywords:
+  - ai_chat
+  - ai-chat
+- name: src
+  description: Files from src/
+  keywords:
+  - src
+  - src
+- name: general
+  description: Files that don't fit other rooms
+  keywords: []

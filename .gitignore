@@ -11,3 +11,5 @@ tests/output/
 scripts/_diag/
 xx/
 old/
+.agents/rules/mempalace_rules.md
+tests/
