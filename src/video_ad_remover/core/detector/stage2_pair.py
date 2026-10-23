@@ -10,8 +10,14 @@
 from __future__ import annotations
 
 import math
+import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import numpy as np
 
 from video_ad_remover.core.detector.stage1_scan import (
     CutPoint,
@@ -29,6 +35,23 @@ from video_ad_remover.models.interval import (
 from video_ad_remover.models.video_meta import VideoMetadata
 
 
+@dataclass
+class Stage2Stats:
+    total_pairs_checked: int = 0
+    duration_filtered: int = 0
+    boundary_score_filtered: int = 0
+    evaluated_pairs: int = 0
+    early_stopped_pairs: int = 0
+    insufficient_samples_pairs: int = 0
+    get_frame_calls: int = 0
+    cache_hits: int = 0
+    cache_misses: int = 0
+    decode_time: float = 0.0
+    feature_compute_time: float = 0.0
+    wall_time: float = 0.0
+    surviving_candidates: int = 0
+
+
 @dataclass(frozen=True)
 class PairConfig:
     target_duration: float = 25.0  # 目標廣告秒數
@@ -38,6 +61,22 @@ class PairConfig:
     iou_threshold: float = 0.40  # 降低重複候選門檻
     max_internal_variance: float = 0.45  # 內部取樣平均差異上限，超過視為正片運鏡淘汰
     stability_sigma: float = 0.12  # 圖卡內部穩定度衰減常數（凸顯靜態圖卡優勢，壓制正片運鏡）
+    cache_max_size: int = 1024  # 區域特徵快取上限容量 (LRU)
+    min_valid_samples: int = 3  # 最少需要 3 個有效內部特徵樣本（至少 2 次相鄰比較）
+    min_boundary_diff_score: float = 0.0  # 起迄點最小轉場強度先驗門檻
+    enable_early_stopping: bool = True  # 啟用數學安全型不可逆超標早停
+
+
+def compute_aspect_preserved_size(
+    orig_w: int, orig_h: int, max_w: int = 160, max_h: int = 90
+) -> tuple[int, int]:
+    """計算維持長寬比的等比例縮圖尺寸（避免非 16:9 畫面拉伸失真）。"""
+    if orig_w <= 0 or orig_h <= 0:
+        return (max_w, max_h)
+    scale = min(max_w / orig_w, max_h / orig_h)
+    new_w = max(2, int(round(orig_w * scale)) // 2 * 2)
+    new_h = max(2, int(round(orig_h * scale)) // 2 * 2)
+    return (new_w, new_h)
 
 
 def _duration_score(duration: float, target: float, sigma: float) -> float:
@@ -51,33 +90,95 @@ def pair_and_score(
     path: str | Path,
     meta: VideoMetadata,
     config: PairConfig | None = None,
+    stats: Stage2Stats | None = None,
 ) -> list[AdCandidate]:
     """將切點集合配對成候選廣告區間，並評分與去重。"""
     cfg = config or PairConfig()
     if len(cut_points) < 2:
         return []
 
+    t_start = time.perf_counter()
     candidates: list[AdCandidate] = []
     extractor = FrameExtractor(path, meta)
+    feat_cache: OrderedDict[int, tuple[np.ndarray, np.ndarray] | None] = OrderedDict()
+    target_size = compute_aspect_preserved_size(meta.width, meta.height, 160, 90)
+
+    def _get_frame(f_idx: int):
+        if stats is not None:
+            stats.get_frame_calls += 1
+            t0 = time.perf_counter()
+            f = extractor.get_frame(f_idx, target_size=target_size)
+            stats.decode_time += time.perf_counter() - t0
+        else:
+            f = extractor.get_frame(f_idx, target_size=target_size)
+        if f is None or f.size == 0:
+            return None
+        return f
+
+    def _calc_feat(img):
+        if stats is not None:
+            t0 = time.perf_counter()
+            res = compute_frame_features(img)
+            stats.feature_compute_time += time.perf_counter() - t0
+            return res
+        return compute_frame_features(img)
+
+    def _get_cached_feature(f_idx: int):
+        if f_idx in feat_cache:
+            if stats is not None:
+                stats.cache_hits += 1
+            feat_cache.move_to_end(f_idx)
+            return feat_cache[f_idx]
+
+        if stats is not None:
+            stats.cache_misses += 1
+
+        img = _get_frame(f_idx)
+        feat = _calc_feat(img) if img is not None else None
+        feat_cache[f_idx] = feat
+        if len(feat_cache) > cfg.cache_max_size:
+            feat_cache.popitem(last=False)
+        return feat
+
+    def _comp_frames(f1, f2) -> float:
+        if stats is not None:
+            t0 = time.perf_counter()
+            res = compare_frames(f1, f2)
+            stats.feature_compute_time += time.perf_counter() - t0
+            return res
+        return compare_frames(f1, f2)
 
     with extractor:
         n = len(cut_points)
         for i in range(n):
             cp_in = cut_points[i]
             for j in range(i + 1, n):
+                if stats is not None:
+                    stats.total_pairs_checked += 1
                 cp_out = cut_points[j]
                 dur = cp_out.timestamp - cp_in.timestamp
 
                 if dur < cfg.min_duration:
+                    if stats is not None:
+                        stats.duration_filtered += 1
                     continue
                 if dur > cfg.max_duration:
+                    if stats is not None:
+                        stats.duration_filtered += 1
                     break
+
+                if stats is not None:
+                    stats.evaluated_pairs += 1
 
                 # 1. 時長分數（25 秒峰值）
                 score_dur = _duration_score(dur, cfg.target_duration, cfg.duration_sigma)
 
                 # 2. 切點強度分數
                 score_cut = 0.5 * (cp_in.diff_score + cp_out.diff_score)
+                if cfg.min_boundary_diff_score > 0.0 and score_cut < cfg.min_boundary_diff_score:
+                    if stats is not None:
+                        stats.boundary_score_filtered += 1
+                    continue
 
                 # 3. 採樣正片前後（各 1 秒處），改為時間軸標準映射（VFR/CFR 安全）
                 t_in = cp_in.timestamp
@@ -85,17 +186,13 @@ def pair_and_score(
                 f_before = meta.frame_at_time(max(0.0, t_in - 1.0))
                 f_after = meta.frame_at_time(min(meta.end_time, t_out + 1.0))
 
-                img_before = extractor.get_frame(f_before, target_size=(160, 90))
-                img_after = extractor.get_frame(f_after, target_size=(160, 90))
+                feat_b = _get_cached_feature(f_before)
+                feat_a = _get_cached_feature(f_after)
 
                 score_context = 0.5
-                feat_b = None
-                feat_a = None
-                if img_before is not None and img_after is not None:
-                    feat_b = compute_frame_features(img_before)
-                    feat_a = compute_frame_features(img_after)
+                if feat_b is not None and feat_a is not None:
                     # 前後正片若連續（同場景/色調相似），相似度越高加分越多
-                    diff_context = compare_frames(feat_b, feat_a)
+                    diff_context = _comp_frames(feat_b, feat_a)
                     score_context = 1.0 - diff_context
 
                 # 4. 廣告區間內部「版面色彩穩定度」取樣檢驗（依時間軸均勻採樣 4 個時間點）
@@ -107,17 +204,35 @@ def pair_and_score(
                 internal_samples = [meta.frame_at_time(t) for t in sample_times]
 
                 internal_feats = []
-                for f_idx in internal_samples:
-                    img = extractor.get_frame(f_idx, target_size=(160, 90))
-                    if img is not None:
-                        internal_feats.append(compute_frame_features(img))
-
-                # 計算內部各取樣點之間的平均變化率
                 internal_diffs = []
-                for k in range(len(internal_feats) - 1):
-                    internal_diffs.append(
-                        compare_frames(internal_feats[k], internal_feats[k + 1])
-                    )
+                early_stop = False
+                expected_diffs = 3  # 4 samples -> 3 adjacent comparisons
+                sum_limit = cfg.max_internal_variance * expected_diffs
+                accumulated_diff = 0.0
+
+                for f_idx in internal_samples:
+                    feat = _get_cached_feature(f_idx)
+                    if feat is not None:
+                        internal_feats.append(feat)
+                        if len(internal_feats) >= 2:
+                            diff_val = _comp_frames(internal_feats[-2], internal_feats[-1])
+                            internal_diffs.append(diff_val)
+                            accumulated_diff += diff_val
+                            # 數學安全早停：即使剩餘未測差異全部為 0，累積總和仍必定超標
+                            if cfg.enable_early_stopping and accumulated_diff > sum_limit:
+                                early_stop = True
+                                if stats is not None:
+                                    stats.early_stopped_pairs += 1
+                                break
+
+                if early_stop:
+                    continue
+
+                # 若內部有效樣本少於門檻（例如 < 3），代表過半影格解碼失敗，判定為不可信區間淘汰
+                if len(internal_feats) < cfg.min_valid_samples:
+                    if stats is not None:
+                        stats.insufficient_samples_pairs += 1
+                    continue
 
                 avg_internal_diff = (
                     sum(internal_diffs) / len(internal_diffs) if internal_diffs else 0.5
@@ -135,8 +250,8 @@ def pair_and_score(
                 score_contrast = 0.5
                 if internal_feats and feat_b and feat_a:
                     mid_feat = internal_feats[len(internal_feats) // 2]
-                    contrast_b = compare_frames(mid_feat, feat_b)
-                    contrast_a = compare_frames(mid_feat, feat_a)
+                    contrast_b = _comp_frames(mid_feat, feat_b)
+                    contrast_a = _comp_frames(mid_feat, feat_a)
                     score_contrast = 0.5 * (contrast_b + contrast_a)
 
                 # 綜合加權：內部穩定度(35%) + 時長(25%) + 切點強度(20%) + 前後正片呼應(10%) + 反差(10%)
@@ -166,4 +281,8 @@ def pair_and_score(
                 candidates.append(cand)
 
     # 去重
-    return dedupe_candidates(candidates, iou_threshold=cfg.iou_threshold)
+    result = dedupe_candidates(candidates, iou_threshold=cfg.iou_threshold)
+    if stats is not None:
+        stats.wall_time = time.perf_counter() - t_start
+        stats.surviving_candidates = len(result)
+    return result
