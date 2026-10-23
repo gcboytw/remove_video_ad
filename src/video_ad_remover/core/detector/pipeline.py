@@ -66,9 +66,16 @@ def detect_ads(
         return []
 
     # ---- Stage 2：時間窗配對與評分 ----
-    report("Stage 2: 廣告區間配對與評分", 0.3)
-    raw_candidates = pair_and_score(cuts, path, meta, config=cfg.pair_config)
-    report("Stage 2: 廣告區間配對與評分", 1.0)
+    report("Stage 2: 廣告區間配對與評分", 0.0)
+    raw_candidates = pair_and_score(
+        cuts,
+        path,
+        meta,
+        config=cfg.pair_config,
+        progress_cb=lambda frac, msg: report(f"Stage 2: {msg}", frac),
+        cancel_event=cancel_event,
+    )
+    report("Stage 2: 廣告區間配對完成", 1.0)
     if cancel_event.is_set() or not raw_candidates:
         return raw_candidates
 

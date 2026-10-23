@@ -10,8 +10,10 @@
 from __future__ import annotations
 
 import math
+import threading
 import time
 from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -33,6 +35,7 @@ from video_ad_remover.models.interval import (
     IntervalStatus,
 )
 from video_ad_remover.models.video_meta import VideoMetadata
+from video_ad_remover.utils.time_conv import format_timestamp
 
 
 @dataclass
@@ -91,6 +94,8 @@ def pair_and_score(
     meta: VideoMetadata,
     config: PairConfig | None = None,
     stats: Stage2Stats | None = None,
+    progress_cb: Callable[[float, str], None] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> list[AdCandidate]:
     """將切點集合配對成候選廣告區間，並評分與去重。"""
     cfg = config or PairConfig()
@@ -102,6 +107,8 @@ def pair_and_score(
     extractor = FrameExtractor(path, meta)
     feat_cache: OrderedDict[int, tuple[np.ndarray, np.ndarray] | None] = OrderedDict()
     target_size = compute_aspect_preserved_size(meta.width, meta.height, 160, 90)
+    cancel_event = cancel_event or threading.Event()
+    last_cb_time = 0.0
 
     def _get_frame(f_idx: int):
         if stats is not None:
@@ -151,7 +158,27 @@ def pair_and_score(
     with extractor:
         n = len(cut_points)
         for i in range(n):
+            if cancel_event.is_set():
+                break
+
             cp_in = cut_points[i]
+
+            # ETA 倒數與候選心跳狀態回報 (節流約每 0.25 秒或最後一格發送一次)
+            now = time.perf_counter()
+            if progress_cb is not None and (now - last_cb_time >= 0.25 or i == n - 1):
+                last_cb_time = now
+                frac = (i + 1) / n
+                elapsed = now - t_start
+                if frac > 0.02 and elapsed > 1.0:
+                    eta_sec = max(0.0, (elapsed / frac) - elapsed)
+                    m, s = divmod(int(eta_sec), 60)
+                    eta_str = f"{m:02d}:{s:02d}"
+                else:
+                    eta_str = "--:--"
+                t_str = format_timestamp(cp_in.timestamp)[:8]
+                status_msg = f"切點 {i+1}/{n} ({t_str}) | 鎖定 {len(candidates)} 候選 | 預估剩餘 {eta_str}"
+                progress_cb(frac, status_msg)
+
             for j in range(i + 1, n):
                 if stats is not None:
                     stats.total_pairs_checked += 1
