@@ -31,7 +31,7 @@ from video_ad_remover.core.interval_calc import compute_keep_segments
 from video_ad_remover.models.interval import FrameInterval, KeepSegment
 from video_ad_remover.models.video_meta import VideoMetadata
 
-TrimMode = Literal["frame", "time"]
+TrimMode = Literal["frame", "time", "select"]
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +130,7 @@ class ExportSettings:
     audio_bitrate: str = "128k"
     faststart: bool = True
     overwrite: bool = False
+    segmented: bool = False
     extra_args: tuple[str, ...] = ()
 
 
@@ -227,6 +228,29 @@ def build_filtergraph(
     k = len(segs)
     parts: list[str] = []
 
+    # ---- CFR 專用單向流水線 (select + aselect) ---------------------------
+    if mode == "select":
+        vin = f"[0:{meta.video_index}]"
+        fps = float(meta.nominal_fps) if meta.nominal_fps else 25.0
+        v_conds = [f"between(n,{seg.start_frame},{seg.end_frame - 1})" for seg in segs]
+        v_expr = "+".join(v_conds)
+        parts.append(f"{vin}select='{v_expr}',setpts=N/({fps}*TB)[vout]")
+
+        audio_label: str | None = None
+        if meta.audio is not None:
+            ain = f"[0:{meta.audio.index}]"
+            pre = "aresample=async=1:first_pts=0"
+            a_conds = [
+                f"between(t,{_fmt(meta.time_of(seg.start_frame))},{_fmt(meta.time_of(seg.end_frame))})"
+                for seg in segs
+            ]
+            a_expr = "+".join(a_conds)
+            parts.append(f"{ain}{pre},aselect='{a_expr}',asetpts=N/SR/TB[aout]")
+            audio_label = "[aout]"
+
+        return FilterGraph(text=";".join(parts), video_label="[vout]", audio_label=audio_label, mode=mode)
+
+    # ---- VFR 專用或自訂 trim + concat 流水線 -----------------------------
     # ---- 視訊 -----------------------------------------------------------
     vin = f"[0:{meta.video_index}]"
     if k == 1:
@@ -341,6 +365,80 @@ def build_command(
     ]
     if settings.faststart:
         cmd += ["-movflags", "+faststart"]
+    cmd += list(settings.extra_args)
+    cmd += ["-progress", "pipe:1", "-nostats", "-f", "mp4", str(output)]
+    return cmd
+
+
+def build_segment_command(
+    meta: VideoMetadata,
+    segment: KeepSegment,
+    output: Path,
+    settings: ExportSettings,
+    *,
+    ffmpeg: str,
+) -> list[str]:
+    """為單一保留段落建立獨立導出指令（隔離廣告異質解析度與時間戳跳躍）。"""
+    codec = resolve_video_codec(settings, ffmpeg=ffmpeg)
+    start_time = meta.time_of(segment.start_frame) if segment.start_frame > 0 else 0.0
+    if not meta.is_vfr:
+        cmd = [
+            ffmpeg, "-hide_banner", "-nostdin", "-y", "-v", "warning",
+            "-ss", f"{start_time:.6f}",
+            "-i", str(meta.path),
+            "-frames:v", str(segment.length),
+        ]
+    else:
+        end_time = meta.time_of(segment.end_frame)
+        dur = max(end_time - start_time, 0.0)
+        cmd = [
+            ffmpeg, "-hide_banner", "-nostdin", "-y", "-v", "warning",
+            "-ss", f"{start_time:.6f}",
+            "-i", str(meta.path),
+            "-t", f"{dur:.6f}",
+        ]
+
+    cmd += ["-c:v", codec]
+    if settings.video_bitrate:
+        cmd += ["-b:v", settings.video_bitrate]
+    else:
+        if codec == "h264_qsv":
+            cmd += ["-global_quality", str(settings.crf)]
+        elif codec == "h264_videotoolbox":
+            q_v = max(30, min(85, int(60 - (settings.crf - 24) * 2.5)))
+            cmd += ["-q:v", str(q_v)]
+        else:
+            cmd += ["-crf", str(settings.crf)]
+
+    if codec == "h264_qsv":
+        qsv_presets = {"veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"}
+        preset = settings.preset
+        if preset == "ultrafast":
+            preset = "veryfast"
+        elif preset not in qsv_presets:
+            preset = "fast"
+        cmd += ["-preset", preset]
+    elif codec == "h264_videotoolbox":
+        pass
+    else:
+        cmd += ["-preset", settings.preset or "veryfast"]
+
+    if settings.pix_fmt:
+        pix_fmt = "nv12" if codec == "h264_qsv" and settings.pix_fmt == "yuv420p" else settings.pix_fmt
+        cmd += ["-pix_fmt", pix_fmt]
+
+    if meta.has_audio:
+        cmd += ["-c:a", settings.audio_codec, "-b:a", settings.audio_bitrate]
+        if meta.audio and meta.audio.sample_rate:
+            cmd += ["-ar", str(meta.audio.sample_rate)]
+
+    fps_mode = "vfr" if meta.is_vfr else "auto"
+    cmd += [
+        "-fps_mode", fps_mode,
+        "-avoid_negative_ts", "make_zero",
+        "-max_muxing_queue_size", "2048",
+        "-map_chapters", "-1",
+    ]
     cmd += list(settings.extra_args)
     cmd += ["-progress", "pipe:1", "-nostats", "-f", "mp4", str(output)]
     return cmd
@@ -467,6 +565,198 @@ def _consume_progress(
         )
 
 
+
+def export_segmented(
+    plan: ExportPlan,
+    *,
+    progress_cb: ProgressCallback | None = None,
+    cancel_event: threading.Event | None = None,
+    log_lines: int = 200,
+) -> ExportResult:
+    """以分段隔離導出 + Concat Demuxer 方式導出（完全避免片中廣告異質解析度或濾鏡重設干擾）。"""
+    if plan.output.exists() and not plan.settings.overwrite:
+        raise FileExistsError(f"輸出檔已存在：{plan.output}（請確認是否覆寫）")
+
+    meta = plan.meta
+    if meta is None:
+        raise ValueError("分段導出需要有效的 VideoMetadata")
+
+    plan.partial_path.parent.mkdir(parents=True, exist_ok=True)
+    cancel_event = cancel_event or threading.Event()
+    ffmpeg_bin = plan.command[0] if plan.command else resolve_tool("ffmpeg")
+    started = time.monotonic()
+    total_time = plan.expected_duration
+    seg_dir = plan.partial_path.parent / f".{plan.partial_path.stem}_segs"
+    seg_dir.mkdir(parents=True, exist_ok=True)
+
+    segment_files: list[Path] = []
+    log_tail: deque[str] = deque(maxlen=log_lines)
+
+    accumulated_time = 0.0
+    accumulated_frames = 0
+
+    try:
+        for idx, segment in enumerate(plan.segments):
+            if cancel_event.is_set():
+                raise ExportCancelled("使用者已取消輸出，暫存檔已清除")
+
+            seg_path = seg_dir / f"seg_{idx:04d}.mp4"
+            segment_files.append(seg_path)
+
+            seg_cmd = build_segment_command(
+                meta,
+                segment,
+                seg_path,
+                plan.settings,
+                ffmpeg=ffmpeg_bin,
+            )
+
+            seg_started = time.monotonic()
+            proc = subprocess.Popen(
+                seg_cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                **hidden_window_kwargs(),
+            )
+            assert proc.stdout is not None and proc.stderr is not None
+            stderr_thread = threading.Thread(target=_drain, args=(proc.stderr, log_tail), daemon=True)
+            watcher = threading.Thread(target=_watch_cancel, args=(proc, cancel_event), daemon=True)
+            stderr_thread.start()
+            watcher.start()
+
+            seg_expected_dur = meta.segment_duration(segment.start_frame, segment.end_frame)
+
+            def make_seg_cb(acc_t: float, acc_f: int) -> ProgressCallback | None:
+                if progress_cb is None:
+                    return None
+
+                def _cb(p: ExportProgress) -> None:
+                    cur_t = acc_t + p.out_time
+                    frac = min(cur_t / total_time, 0.999) if total_time > 0 else 0.0
+                    elapsed = time.monotonic() - started
+                    eta = (elapsed * (1 - frac) / frac) if 0 < frac < 1 else None
+                    progress_cb(
+                        ExportProgress(
+                            fraction=frac,
+                            out_time=cur_t,
+                            total_time=total_time,
+                            frame=acc_f + p.frame,
+                            speed=p.speed,
+                            eta_seconds=eta,
+                        )
+                    )
+
+                return _cb
+
+            try:
+                _consume_progress(
+                    proc.stdout,
+                    seg_expected_dur,
+                    make_seg_cb(accumulated_time, accumulated_frames),
+                    seg_started,
+                )
+                rc = proc.wait()
+            except BaseException:
+                _terminate(proc)
+                raise
+            finally:
+                stderr_thread.join(timeout=5)
+
+            if cancel_event.is_set():
+                raise ExportCancelled("使用者已取消輸出，暫存檔已清除", "\n".join(log_tail))
+            if rc != 0:
+                raise ExportError(f"分段 {idx} 導出失敗（exit code {rc}）", "\n".join(log_tail))
+
+            accumulated_time += seg_expected_dur
+            accumulated_frames += segment.length
+
+        # 拼接段落
+        list_file = seg_dir / "concat_list.txt"
+        list_content = "\n".join(f"file '{p.as_posix()}'" for p in segment_files) + "\n"
+        list_file.write_text(list_content, encoding="utf-8")
+
+        concat_cmd = [
+            ffmpeg_bin, "-hide_banner", "-nostdin", "-y", "-v", "warning",
+            "-f", "concat", "-safe", "0",
+            "-i", str(list_file),
+            "-c", "copy",
+        ]
+        if plan.settings.faststart:
+            concat_cmd += ["-movflags", "+faststart"]
+        concat_cmd += [str(plan.partial_path)]
+
+        concat_proc = subprocess.run(
+            concat_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            **hidden_window_kwargs(),
+        )
+        if concat_proc.returncode != 0:
+            raise ExportError("段落無損合併失敗", concat_proc.stderr)
+
+    except BaseException:
+        _safe_unlink(plan.partial_path)
+        for p in segment_files:
+            _safe_unlink(p)
+        try:
+            list_file = seg_dir / "concat_list.txt"
+            _safe_unlink(list_file)
+            seg_dir.rmdir()
+        except OSError:
+            pass
+        raise
+
+    # 驗收（容許誤差考量多段拼接時之容器時間戳取整累積，每段容許 1.5 格）
+    from video_ad_remover.core.verifier import verify_output
+
+    seg_tol = max(0.060, len(plan.segments) * (1.5 / meta.nominal_fps))
+    verification_report = None
+    try:
+        verification_report = verify_output(
+            plan.partial_path,
+            expected_duration=plan.expected_duration,
+            expected_frames=plan.expected_frames,
+            expect_audio=meta.has_audio,
+            tolerance=seg_tol,
+        )
+    except Exception as exc:
+        logger.warning("分段輸出驗證異常：%s", exc)
+
+    if verification_report is not None and not verification_report.ok:
+        ng_details = [c.detail for c in verification_report.checks if not c.passed]
+        err_summary = "；".join(ng_details)
+        _safe_unlink(plan.partial_path)
+        raise ExportError(
+            f"分段輸出檔未通過品質驗收（{err_summary}），已中止替換正式檔案以保護資料完整性。",
+            "\n".join(log_tail),
+        )
+
+    # 清理臨時 segments 目錄
+    for p in segment_files:
+        _safe_unlink(p)
+    try:
+        list_file = seg_dir / "concat_list.txt"
+        _safe_unlink(list_file)
+        seg_dir.rmdir()
+    except OSError:
+        pass
+
+    os.replace(plan.partial_path, plan.output)
+    return ExportResult(
+        output=plan.output,
+        plan=plan,
+        elapsed=time.monotonic() - started,
+        log_tail="\n".join(log_tail),
+        verification=verification_report,
+    )
+
+
 def run_export(
     plan: ExportPlan,
     *,
@@ -476,6 +766,14 @@ def run_export(
     allow_fallback: bool = True,
 ) -> ExportResult:
     """執行 FFmpeg 輸出。可由另一執行緒設定 ``cancel_event`` 安全取消（FR-012）。"""
+    if plan.settings.segmented and len(plan.segments) > 1:
+        return export_segmented(
+            plan,
+            progress_cb=progress_cb,
+            cancel_event=cancel_event,
+            log_lines=log_lines,
+        )
+
     if plan.output.exists() and not plan.settings.overwrite:
         raise FileExistsError(f"輸出檔已存在：{plan.output}（請確認是否覆寫）")
     plan.partial_path.parent.mkdir(parents=True, exist_ok=True)
@@ -516,6 +814,17 @@ def run_export(
         raise ExportCancelled("使用者已取消輸出，暫存檔已清除", tail)
     if returncode != 0:
         _safe_unlink(plan.partial_path)
+        if allow_fallback and len(plan.segments) > 1 and plan.meta is not None:
+            logger.warning(
+                "單一管線執行失敗（exit code %s），自動切換至『分段隔離導出機制』進行修復...",
+                returncode,
+            )
+            return export_segmented(
+                plan,
+                progress_cb=progress_cb,
+                cancel_event=cancel_event,
+                log_lines=log_lines,
+            )
         is_hw = (
             "-c:v" in plan.command
             and plan.command[plan.command.index("-c:v") + 1]
@@ -546,9 +855,80 @@ def run_export(
     if not plan.partial_path.is_file() or plan.partial_path.stat().st_size == 0:
         raise ExportError("FFmpeg 結束但沒有產生輸出檔", tail)
 
+    # 搬移至正式檔名前進行強制品質驗收（Safety Gate）
+    from video_ad_remover.core.verifier import verify_output
+
+    verification_report = None
+    if plan.meta is not None:
+        try:
+            verification_report = verify_output(
+                plan.partial_path,
+                expected_duration=plan.expected_duration,
+                expected_frames=plan.expected_frames,
+                expect_audio=plan.meta.has_audio,
+            )
+        except Exception as exc:
+            logger.warning("輸出驗證過程異常：%s", exc)
+
+    if verification_report is not None and not verification_report.ok:
+        ng_details = [c.detail for c in verification_report.checks if not c.passed]
+        err_summary = "；".join(ng_details)
+        logger.warning("輸出檔未通過品質驗收：%s", err_summary)
+
+        if allow_fallback and len(plan.segments) > 1 and plan.meta is not None:
+            logger.warning(
+                "單一管線輸出未達品質標準（%s），偵測到可能受廣告動態解析度改變或濾鏡重設干擾，自動切換至『分段隔離導出機制』進行修復...",
+                err_summary,
+            )
+            _safe_unlink(plan.partial_path)
+            return export_segmented(
+                plan,
+                progress_cb=progress_cb,
+                cancel_event=cancel_event,
+                log_lines=log_lines,
+            )
+
+        is_hw = (
+            "-c:v" in plan.command
+            and plan.command[plan.command.index("-c:v") + 1]
+            in ("h264_qsv", "h264_nvenc", "h264_amf", "h264_videotoolbox")
+        )
+        if allow_fallback and is_hw and plan.meta is not None:
+            logger.warning(
+                "硬體編碼產出未達品質標準（%s），自動降級切換至 libx264 (CPU) 重新嘗試輸出...",
+                err_summary,
+            )
+            _safe_unlink(plan.partial_path)
+            fallback_settings = replace(plan.settings, video_codec="libx264")
+            fallback_cmd = build_command(
+                plan.meta,
+                plan.graph,
+                plan.partial_path,
+                fallback_settings,
+                ffmpeg=plan.command[0],
+            )
+            fallback_plan = replace(plan, command=tuple(fallback_cmd), settings=fallback_settings)
+            return run_export(
+                fallback_plan,
+                progress_cb=progress_cb,
+                cancel_event=cancel_event,
+                log_lines=log_lines,
+                allow_fallback=False,
+            )
+
+        _safe_unlink(plan.partial_path)
+        raise ExportError(
+            f"輸出檔未通過品質驗收（{err_summary}），已中止替換正式檔案以保護資料完整性。",
+            tail,
+        )
+
     os.replace(plan.partial_path, plan.output)
     return ExportResult(
-        output=plan.output, plan=plan, elapsed=time.monotonic() - started, log_tail=tail
+        output=plan.output,
+        plan=plan,
+        elapsed=time.monotonic() - started,
+        log_tail=tail,
+        verification=verification_report,
     )
 
 
@@ -565,7 +945,7 @@ def export_video(
     """便利函式：規劃 -> 執行 -> （選用）FFprobe 自動驗證（FR-013）。"""
     plan = plan_export(meta, ad_intervals, output, settings)
     result = run_export(plan, progress_cb=progress_cb, cancel_event=cancel_event)
-    if verify:
+    if verify and result.verification is None:
         from video_ad_remover.core.verifier import verify_output
 
         result.verification = verify_output(
