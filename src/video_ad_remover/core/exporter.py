@@ -224,7 +224,7 @@ def build_filtergraph(
     for seg in segs:
         if seg.end_frame > meta.frame_count:
             raise ValueError(f"保留區間 {seg} 超出影片總影格數 {meta.frame_count}")
-    mode = mode or ("time" if meta.is_vfr else "frame")
+    mode = mode or ("time" if meta.is_vfr else "select")
     k = len(segs)
     parts: list[str] = []
 

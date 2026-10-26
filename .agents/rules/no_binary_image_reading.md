@@ -1,3 +1,19 @@
+---
+trigger: always_on
+---
+
+# CRITICAL SYSTEM RESTRICTION: TOOL USAGE FOR IMAGES
+
+1. **NEVER CALL FILE VIEW TOOLS ON IMAGES**:
+   - You are STRICTLY FORBIDDEN from using `view_file`, `read_file`, `open_file`, or any visual preview tools on files ending in:
+     `.png`, `.jpg`, `.jpeg`, `.webp`, `.bmp`, `.gif`.
+   - Reason: The IDE converts these files into oversized base64 API payloads that immediately crash the session (`Agent execution terminated due to error`).
+
+2. **HANDLING IMAGE PATHS IN TERMINAL**:
+   - If a Python script outputs a path to an image file, DO NOT attempt to inspect it.
+   - Simply treat it as an opaque artifact for human review and report the script's numerical terminal output.
+
+
 # 影格與影像檔案分析規範（No Binary Image Reading Rule）
 
 本規則適用於本專案（`remove_video_ad`）。
