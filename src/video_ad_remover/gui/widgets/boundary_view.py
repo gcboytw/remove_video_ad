@@ -31,7 +31,7 @@ from video_ad_remover.models.video_meta import VideoMetadata
 from video_ad_remover.utils.time_conv import format_timestamp
 
 
-def _mat_to_pixmap(mat: np.ndarray, width: int = 180, height: int = 100) -> QPixmap:
+def _mat_to_pixmap(mat: np.ndarray, width: int = 200, height: int = 112) -> QPixmap:
     """將 OpenCV BGR 轉為 QPixmap 縮圖。"""
     h, w, ch = mat.shape
     bytes_per_line = ch * w
@@ -64,7 +64,7 @@ class SingleFrameCard(QFrame):
         self.lbl_info.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         self.lbl_img = QLabel()
-        self.lbl_img.setFixedSize(180, 100)
+        self.lbl_img.setFixedSize(200, 112)
         self.lbl_img.setStyleSheet("background-color: #1e1e1e; border: 1px solid #444;")
         self.lbl_img.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
@@ -96,49 +96,76 @@ class BoundaryView(QWidget):
     def _init_ui(self) -> None:
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
-        layout.setSpacing(6)
+        layout.setSpacing(4)
 
         # 頂部標題
         lbl_header = QLabel("🔍 四格邊界檢查與微調 (4-Frame Boundary View)")
         lbl_header.setStyleSheet("font-weight: bold; font-size: 12px; color: #4fa3d1;")
         layout.addWidget(lbl_header)
 
-        # 四張縮圖橫向排列
-        cards_layout = QHBoxLayout()
-        cards_layout.setSpacing(6)
+        # 四張縮圖與微調按鈕網格佈局（確保終點按鈕組精確與卡片3左對齊）
+        grid = QGridLayout()
+        grid.setSpacing(6)
+        grid.setContentsMargins(0, 0, 0, 0)
 
         self.card_prev = SingleFrameCard("1. 廣告前一格 (正片最後)")
         self.card_start = SingleFrameCard("2. 廣告第一格 (切入)")
         self.card_last = SingleFrameCard("3. 廣告最後一格 (圖卡最後)")
         self.card_resume = SingleFrameCard("4. 正片第一格 (恢復)")
 
-        cards_layout.addWidget(self.card_prev)
-        cards_layout.addWidget(self.card_start)
-        cards_layout.addWidget(self.card_last)
-        cards_layout.addWidget(self.card_resume)
-        layout.addLayout(cards_layout)
+        # Row 0: 四張縮圖橫向排開 (Col 0 ~ 3)
+        grid.addWidget(self.card_prev, 0, 0)
+        grid.addWidget(self.card_start, 0, 1)
+        grid.addWidget(self.card_last, 0, 2)
+        grid.addWidget(self.card_resume, 0, 3)
 
-        # 微調控制按鈕列
-        ctrl_layout = QGridLayout()
+        # 起點微調按鈕組
+        btn_s_m10 = QPushButton("起 -10")
+        btn_s_m1 = QPushButton("起 -1")
+        btn_s_p1 = QPushButton("起 +1")
+        btn_s_p10 = QPushButton("起 +10")
 
-        # 起點微調
-        btn_start_dec = QPushButton("◀ 起點 -1格")
-        btn_start_inc = QPushButton("起點 +1格 ▶")
-        btn_start_dec.clicked.connect(lambda: self._adjust_start(-1))
-        btn_start_inc.clicked.connect(lambda: self._adjust_start(+1))
+        btn_s_m10.clicked.connect(lambda: self._adjust_start(-10))
+        btn_s_m1.clicked.connect(lambda: self._adjust_start(-1))
+        btn_s_p1.clicked.connect(lambda: self._adjust_start(+1))
+        btn_s_p10.clicked.connect(lambda: self._adjust_start(+10))
 
-        # 終點微調
-        btn_end_dec = QPushButton("◀ 終點 -1格")
-        btn_end_inc = QPushButton("終點 +1格 ▶")
-        btn_end_dec.clicked.connect(lambda: self._adjust_end(-1))
-        btn_end_inc.clicked.connect(lambda: self._adjust_end(+1))
+        start_btn_layout = QHBoxLayout()
+        start_btn_layout.setContentsMargins(0, 2, 0, 0)
+        start_btn_layout.setSpacing(4)
+        for btn in (btn_s_m10, btn_s_m1, btn_s_p1, btn_s_p10):
+            btn.setFixedHeight(24)
+            btn.setFixedWidth(64)
+            btn.setStyleSheet("font-size: 11px; padding: 2px;")
+            start_btn_layout.addWidget(btn)
+        start_btn_layout.addStretch()
 
-        ctrl_layout.addWidget(btn_start_dec, 0, 0)
-        ctrl_layout.addWidget(btn_start_inc, 0, 1)
-        ctrl_layout.addWidget(btn_end_dec, 0, 2)
-        ctrl_layout.addWidget(btn_end_inc, 0, 3)
+        # 終點微調按鈕組
+        btn_e_m10 = QPushButton("終 -10")
+        btn_e_m1 = QPushButton("終 -1")
+        btn_e_p1 = QPushButton("終 +1")
+        btn_e_p10 = QPushButton("終 +10")
 
-        layout.addLayout(ctrl_layout)
+        btn_e_m10.clicked.connect(lambda: self._adjust_end(-10))
+        btn_e_m1.clicked.connect(lambda: self._adjust_end(-1))
+        btn_e_p1.clicked.connect(lambda: self._adjust_end(+1))
+        btn_e_p10.clicked.connect(lambda: self._adjust_end(+10))
+
+        end_btn_layout = QHBoxLayout()
+        end_btn_layout.setContentsMargins(0, 2, 0, 0)
+        end_btn_layout.setSpacing(4)
+        for btn in (btn_e_m10, btn_e_m1, btn_e_p1, btn_e_p10):
+            btn.setFixedHeight(24)
+            btn.setFixedWidth(64)
+            btn.setStyleSheet("font-size: 11px; padding: 2px;")
+            end_btn_layout.addWidget(btn)
+        end_btn_layout.addStretch()
+
+        # Row 1: 起點組跨 Col 0~1，終點組精準從 Col 2 開始跨 Col 2~3（與第3張卡片左對齊）
+        grid.addLayout(start_btn_layout, 1, 0, 1, 2)
+        grid.addLayout(end_btn_layout, 1, 2, 1, 2)
+
+        layout.addLayout(grid)
 
     def set_context(self, meta: VideoMetadata, extractor: FrameExtractor) -> None:
         self.meta = meta
@@ -170,7 +197,7 @@ class BoundaryView(QWidget):
             (self.card_last, f_last),
             (self.card_resume, f_resume),
         ]:
-            img = self.extractor.get_exact_frame(f_idx, target_size=(180, 100))
+            img = self.extractor.get_exact_frame(f_idx, target_size=(200, 112))
             pm = _mat_to_pixmap(img) if img is not None else None
             t = self.meta.time_of(f_idx) if f_idx < total else 0.0
             card.set_content(f_idx, t, pm)

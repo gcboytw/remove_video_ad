@@ -215,8 +215,13 @@ class CandidateListWidget(QWidget):
             self.table.setItem(row, 3, item_dur)
 
             # 5. 評分
-            item_score = QTableWidgetItem(f"{cand.score:.2f}")
+            score_text = f"{cand.score:.2f}"
+            if "動畫" in cand.note:
+                score_text += " 🎬"
+            item_score = QTableWidgetItem(score_text)
             item_score.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            if cand.note:
+                item_score.setToolTip(cand.note)
             self.table.setItem(row, 4, item_score)
 
             # 6. 確認狀態下拉選單

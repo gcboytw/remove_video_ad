@@ -14,3 +14,4 @@ old/
 .agents/rules/mempalace_rules.md
 tests/
 graphify-out/
+.test-tmp/

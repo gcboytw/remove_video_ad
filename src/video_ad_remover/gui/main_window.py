@@ -6,6 +6,7 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QCheckBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -17,6 +18,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from video_ad_remover.core.detector.pipeline import PipelineConfig
 from video_ad_remover.core.exporter import (
     ExportProgress,
     ExportResult,
@@ -70,6 +72,17 @@ class MainWindow(QMainWindow):
         self.btn_scan.clicked.connect(self._start_scan)
         top_bar.addWidget(self.btn_scan)
 
+        # 廣告偵測類型勾選方塊
+        self.chk_detect_animation = QCheckBox("🎬 動畫廣告")
+        self.chk_detect_animation.setChecked(True)
+        self.chk_detect_animation.setToolTip("啟用 FFmpeg 音視融合瞬時響度快篩（針對高動態 15~20 秒商業廣告）")
+        top_bar.addWidget(self.chk_detect_animation)
+
+        self.chk_detect_static = QCheckBox("🖼️ 圖卡廣告")
+        self.chk_detect_static.setChecked(True)
+        self.chk_detect_static.setToolTip("啟用原 Stage 1~3 視覺三階段掃描（針對 25 秒固定圖卡）")
+        top_bar.addWidget(self.chk_detect_static)
+
         self.lbl_info = QLabel("尚未載入影片")
         self.lbl_info.setStyleSheet("color: #aaaaaa; margin-left: 10px;")
         top_bar.addWidget(self.lbl_info)
@@ -90,7 +103,7 @@ class MainWindow(QMainWindow):
         self.boundary_view = BoundaryView()
         self.boundary_view.interval_changed.connect(self._on_interval_modified)
 
-        v_left_layout.addWidget(self.player_panel, stretch=3)
+        v_left_layout.addWidget(self.player_panel, stretch=5)
         v_left_layout.addWidget(self.boundary_view, stretch=2)
         h_splitter.addWidget(v_left_widget)
 
@@ -177,8 +190,22 @@ class MainWindow(QMainWindow):
         if not self.meta:
             return
 
+        enable_anim = self.chk_detect_animation.isChecked()
+        enable_static = self.chk_detect_static.isChecked()
+
+        if not enable_anim and not enable_static:
+            QMessageBox.information(self, "提示", "請至少勾選一種廣告偵測類型（動畫廣告或圖卡廣告）")
+            return
+
         self.btn_scan.setEnabled(False)
-        self.scan_worker = ScanWorker(self.meta.path, self.meta)
+        self.chk_detect_animation.setEnabled(False)
+        self.chk_detect_static.setEnabled(False)
+
+        cfg = PipelineConfig(
+            enable_animation_ad=enable_anim,
+            enable_static_card=enable_static,
+        )
+        self.scan_worker = ScanWorker(self.meta.path, self.meta, config=cfg)
         self.scan_worker.progress_updated.connect(
             lambda stage, frac: self.lbl_info.setText(f"{stage} ({int(frac*100)}%)")
         )
@@ -188,6 +215,8 @@ class MainWindow(QMainWindow):
 
     def _on_scan_success(self, candidates: list[AdCandidate]) -> None:
         self.btn_scan.setEnabled(True)
+        self.chk_detect_animation.setEnabled(True)
+        self.chk_detect_static.setEnabled(True)
         self.candidates = candidates
         self.candidate_list.set_candidates(candidates)
         self.timeline_panel.set_data(self.meta, candidates)
@@ -199,6 +228,8 @@ class MainWindow(QMainWindow):
 
     def _on_scan_error(self, err_msg: str) -> None:
         self.btn_scan.setEnabled(True)
+        self.chk_detect_animation.setEnabled(True)
+        self.chk_detect_static.setEnabled(True)
         self.lbl_info.setText("掃描中止")
         QMessageBox.warning(self, "掃描提示", err_msg)
 
